@@ -325,12 +325,11 @@ function manifestFields(text) {
 function cardHTML(m, { ogOnly = false, siteName, slug, origin } = {}) {
   const f = manifestFields(m.text);
   const canonical = m.text.includes("AGENT-INGEST.md") ? "INGEST.md" : "INGEST.md";
-  // Two-tier owl law, derived from origin: viiy.to carries the Watchman
-  // (the inhouse mark); every other host carries the gestowl (the open mark).
-  const personalCard = String(origin || "").includes("viiy.to");
-  const brandIcon = personalCard ? "/assets/owl-brand-48.png" : "/assets/gestowl-brand-48.png";
-  const ogCard = personalCard ? "/assets/design/og-card-owl.png" : "/assets/design/og-card-gestowl.png";
-  const brandAlt = personalCard ? "The Watchman owl — the inhouse viiy gest mark" : "The gestowl — the open gest mark";
+  // Watchman is the primary ingest mark everywhere (reverted 2026-10-17 per
+  // Justin); gestowl stays in assets/ as the secondary gest mark for gests.
+  const brandIcon = "/assets/owl-brand-48.png";
+  const ogCard = "/assets/design/og-card-owl.png";
+  const brandAlt = "The Watchman owl — the ingest mark";
   // Absolute share URLs — relative links break at no-trailing-slash package URLs
   // (Reader-style proxies and LLMs follow links verbatim).
   const base = slug && origin ? `${origin}/${slug}` : "";
