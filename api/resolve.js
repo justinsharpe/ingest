@@ -6,6 +6,7 @@
 const { classify, TRY } = require("./lib/classify.js");
 const PACKAGES = require("./lib/packages.generated.js");
 const { zipBuild } = require("./lib/zip.js");
+const { access, visibilityOf } = require("./lib/visibility.js");
 
 // In production, slugs map to package dirs under /packages at build time —
 // tools/embed-packages.js bakes them into api/lib/packages.generated.js, so
@@ -130,6 +131,7 @@ module.exports = async (req, res) => {
 
   // ── package routes ─────────────────────────────────────────────
   if (view === "manifest") {
+    if (enforceVisibility(slug, req, res)) return;
     const manifest = readPackageFile(slug, file || "INGEST.md");
     if (!manifest) return notFound(res, slug);
     res.writeHead(200, {
@@ -141,6 +143,7 @@ module.exports = async (req, res) => {
   }
 
   if (view === "og" || view === "card") {
+    if (enforceVisibility(slug, req, res)) return;
     const manifest = readPackageFile(slug, "INGEST.md");
     if (!manifest) return notFound(res, slug);
     const cardPage = cardHTML(manifest, {
@@ -153,6 +156,7 @@ module.exports = async (req, res) => {
   }
 
   if (view === "file") {
+    if (enforceVisibility(slug, req, res)) return;
     // one-click install: the whole artifact set as a deterministic zip
     if (file === "archive.zip") {
       const entries = PACKAGES[slug];
@@ -231,8 +235,35 @@ function ownerOf(slug) {
   return ((t.match(/\*\*Owner:\*\* ([^\n]+)/) || [])[1] || "").trim().toLowerCase();
 }
 
+// ── U3 visibility enforcement (public / unlisted / private) ────────────
+// The privacy law, applied at every serving choke point. The grant is the
+// ONLY path into a private gest; the owner in the URL is decoration (the
+// x.com/i/status law) and never grants access on its own.
+function grantToken(req) {
+  const url = new URL(req.url, "http://x");
+  const q = url.searchParams.get("grant");
+  if (q != null && q !== "") return q;
+  const headers = req.headers || {};
+  for (const k of Object.keys(headers)) {
+    if (k.toLowerCase() === "x-gest-grant") {
+      const v = String(headers[k]).trim();
+      if (v) return v;
+    }
+  }
+  return null;
+}
+
+// returns true when access is denied and the response has already been written
+function enforceVisibility(slug, req, res) {
+  const { allow, status } = access(manifestOf(slug).text, grantToken(req));
+  if (allow) return false;
+  forbidden(res, slug, status);
+  return true;
+}
+
 // owner/id serving: same three surfaces, same code path as slug serving
 function serveGest(req, res, slug, siteName, host) {
+  if (enforceVisibility(slug, req, res)) return;
   const { classify } = require("./lib/classify.js");
   const url = new URL(req.url, "http://x");
   const { view } = classify(url.pathname, req.headers);
@@ -294,7 +325,12 @@ function readPackageFile(slug, file) {
 }
 
 function listSlugs() {
-  return Object.keys(PACKAGES);
+  // The host index is a public ledger surface: only public gests list here.
+  // Unlisted gests resolve by reference but never appear; private gests need a
+  // grant and are never enumerated. Internal entries (__*, assets) are hidden.
+  return Object.keys(PACKAGES).filter(
+    (slug) => !slug.startsWith("__") && slug !== "assets" && visibilityOf(manifestOf(slug).text) === "public"
+  );
 }
 
 function esc(s) {
@@ -309,6 +345,18 @@ function notFound(res, slug, file) {
 <p>No package <code>${esc(slug || "")}</code>${file ? ` / <code>${esc(file)}</code>` : ""} here.</p>
 <p><a style="color:#58a6ff" href="/">← agnt.in</a></p></body></html>`;
   res.writeHead(404, { "Content-Type": "" + "text/html; charset=utf-8" });
+  res.end(body);
+}
+
+function forbidden(res, slug, status = 403) {
+  // quip (the Sept-19 microcopy law): our lingo at the touchpoints. The body
+  // reveals only that a grant is required — never the manifest's contents.
+  const body = `<!doctype html><html><head><meta charset="utf-8"><title>private — agnt.in</title></head>
+<body style="font-family:ui-monospace,monospace;background:#0d1117;color:#e6edf3;padding:8vh 24px">
+<h2>403</h2><p><i>this one keeps a secret — and you don't hold the key</i></p>
+<p>This gest is <code>private</code>; it opens only with the access grant.</p>
+<p><a style="color:#58a6ff" href="/">← agnt.in</a></p></body></html>`;
+  res.writeHead(status, { "Content-Type": "text/html; charset=utf-8", "X-Robots-Tag": "noindex, nofollow" });
   res.end(body);
 }
 
