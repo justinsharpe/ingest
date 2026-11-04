@@ -48,6 +48,9 @@ jobs:
       - name: Reference CLI is loadable
         run: python3 ingest.py --help
 
+      - name: U1 receipts (verify-before-ship battery, forced failure modes)
+        run: python3 tests/test_receipts.py
+
       - name: Generated output must not be committed
         run: |
           if git ls-files --error-unmatch api/lib/packages.generated.js >/dev/null 2>&1; then

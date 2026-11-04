@@ -19,6 +19,8 @@ A minimal example: one README, one data file, one fingerprint.
 
 - `README.md` — 23 bytes
 - `data.txt` — 8 bytes
+- `share-card.html` — 1,083 bytes
+- `share-card.png` — 41,880 bytes
 
 ## The one-liner
 

@@ -17,14 +17,15 @@ MediaPlural/bradan — the knowledge consumer: point it at anything (website, co
 
 ## File map
 
-- `CONTRIBUTING.md` — 2,658 bytes
+- `CONTRIBUTING.md` — 2,656 bytes
 - `HANDBOOK.md` — 3,926 bytes
 - `INTEGRATIONS.md` — 3,262 bytes
-- `README.md` — 7,344 bytes
-- `bluf.txt` — 364 bytes
+- `README.md` — 7,340 bytes
+- `bluf.txt` — 362 bytes
 - `consumer.py` — 2,412 bytes
 - `docs__RUNTIMES.md` — 2,039 bytes
-- `skills__consumer__SKILL.md` — 6,805 bytes
+- `share-post.html` — 2,740 bytes
+- `skills__consumer__SKILL.md` — 6,801 bytes
 
 ## The one-liner
 

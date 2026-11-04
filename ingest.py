@@ -49,13 +49,72 @@ def find_manifest(root: pathlib.Path):
     return None
 
 
+def artifact_files(root: pathlib.Path):
+    """The artifact set: every file under root except the two manifest names,
+    in the deterministic sorted order the fingerprint is computed over."""
+    return sorted(p for p in root.rglob("*")
+                  if p.is_file() and p.name not in (CANONICAL, ALIAS))
+
+
 def fingerprint_files(root: pathlib.Path):
     """sha256 over the artifact set (manifest excluded, both names)."""
     h = hashlib.sha256()
-    for f in sorted(p for p in root.rglob("*")
-                    if p.is_file() and p.name not in (CANONICAL, ALIAS)):
+    for f in artifact_files(root):
         h.update(f.read_bytes())
     return h.hexdigest()[:16]
+
+
+FILE_MAP_HEADER = "## File map"
+FILE_MAP_LINE = re.compile(r"^- `([^`]+)`.*?([0-9][0-9,]*)\s*bytes\s*$")
+
+
+def parse_file_map(text: str):
+    """Extract {relative-path: size} from the manifest's `## File map` section.
+
+    Returns None when there is no File map section at all (a non-conforming
+    manifest — the file map is a REQUIRED field per SPEC.md §3). Sizes are
+    comma-formatted in the reference manifest (e.g. `1,234 bytes`), so the
+    comma is stripped before int(). The `.*?` between the path and the size
+    tolerates the older `build_agent_ingest.py` layout (`- `path` — hint —
+    N bytes`).
+    """
+    saw_header = False
+    in_section = False
+    entries = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            saw_header = saw_header or (stripped == FILE_MAP_HEADER)
+            in_section = (stripped == FILE_MAP_HEADER)
+            continue
+        if in_section:
+            m = FILE_MAP_LINE.match(stripped)
+            if m:
+                entries[m.group(1)] = int(m.group(2).replace(",", ""))
+    return entries if saw_header else None
+
+
+def verify_consistency(root: pathlib.Path, file_map: dict):
+    """Compare the manifest's file map against the actual tree.
+
+    Returns a list of (kind, detail) findings; an empty list means the two
+    agree exactly. Kinds:
+      phantom  — listed in the manifest but absent from the tree
+      size     — listed with a size that differs from the tree bytes
+      unlisted — present in the tree but missing from the file map
+    """
+    actual = {f.relative_to(root).as_posix(): f.stat().st_size
+              for f in artifact_files(root)}
+    findings = []
+    for path, size in file_map.items():
+        if path not in actual:
+            findings.append(("phantom", path))
+        elif actual[path] != size:
+            findings.append(("size", path))
+    for path in actual:
+        if path not in file_map:
+            findings.append(("unlisted", path))
+    return findings
 
 
 def manifest_text(root, bluf, files, fp, video="", visibility="unlisted", grant_line="", tagline="", gest_id="", owner=""):
@@ -95,7 +154,7 @@ def cmd_init(args):
         print(f"ERROR: {args.dir} is not a directory"); return 1
     if args.visibility not in ("public", "unlisted", "private"):
         print("ERROR: --visibility must be public|unlisted|private"); return 1
-    files = sorted(p for p in root.rglob("*") if p.is_file() and p.name not in (CANONICAL, ALIAS))
+    files = artifact_files(root)
     if not files:
         print(f"ERROR: {root} is empty — nothing to ingest"); return 1
     bluf = pathlib.Path(args.bluf).read_text(encoding="utf-8").strip() if args.bluf else "(BLUF not yet written — write it before sharing.)"
@@ -133,14 +192,33 @@ def cmd_verify(args):
     if m is None:
         print(f"ERROR: no {CANONICAL} or {ALIAS} in {root}"); return 1
     text = m.read_text(encoding="utf-8")
-    import re
     got = re.search(r"fingerprint \(sha256\)\:\*?\*? `([0-9a-f]{16})`", text)
     if not got:
         print("ERROR: manifest carries no fingerprint"); return 1
+    manifest_fp = got.group(1)
     fp = fingerprint_files(root)
-    ok = fp == got.group(1)
-    print(f"{'OK' if ok else 'MISMATCH'}: manifest {got.group(1)} vs recomputed {fp}")
+    fp_ok = fp == manifest_fp
+
+    # File-map consistency: the manifest must enumerate the tree exactly.
+    # A phantom (listed-but-absent) or unlisted (present-but-unlisted) file, or
+    # a size mismatch, is a refusal — never silently accepted (verify-before-ship).
+    file_map = parse_file_map(text)
+    fm_ok = file_map is not None
+    findings = verify_consistency(root, file_map) if file_map is not None else []
+
+    print(f"{'OK' if fp_ok else 'MISMATCH'}: manifest {manifest_fp} vs recomputed {fp}")
     print(f"   manifest file: {m.name} ({'canonical' if m.name == CANONICAL else 'alias'})")
+    if not fm_ok:
+        print("FLAG: manifest carries no `## File map` section (required) — the file set is unverifiable")
+    labels = {
+        "phantom": "PHANTOM file (listed in map, absent from tree)",
+        "size": "SIZE mismatch (listed vs actual bytes)",
+        "unlisted": "UNLISTED file (in tree, absent from map)",
+    }
+    for kind, path in sorted(findings):
+        print(f"FLAG: {labels[kind]}: `{path}`")
+    ok = fp_ok and fm_ok and not findings
+    print("VERIFY " + ("PASS" if ok else "FAIL — refused"))
     return 0 if ok else 2
 
 
