@@ -31,7 +31,8 @@ content, into any directory. The receipt's own log fields (`out`, `fetched_at`)
 are the only variance, so a package's fingerprint is stable across machines
 while its provenance is still recorded.
 
-Zero dependencies, no account, no service (stdlib only; urllib + xml.etree).
+Zero dependencies, no account, no service (stdlib only; SSRF-hardened
+http.client fetch + xml.etree).
 Runs on Python 3.9 (stock macOS) through 3.13+ — the annotations are lazy.
 
 Exit: 0 ok; 2 source problem (unreachable locator, malformed payload, refused
@@ -43,17 +44,20 @@ import argparse
 import datetime as _dt
 import hashlib
 import json
+import os
 import pathlib
 import re
 import sys
 import unicodedata
-import urllib.request
 import xml.etree.ElementTree as ET
+
+# ssrf.py is a sibling tool; the script dir is on sys.path when run as a
+# script, and this insert makes it robust when imported as a module.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ssrf  # noqa: E402  (SSRF-hardened fetch)
 
 VERSION = "0.1.0"
 SOURCES_RECEIPT = "SOURCES.json"
-UA = "ingest-source/0.1 (+https://github.com/justinsharpe/ingest)"
-TIMEOUT = 20
 MAX_BYTES = 8 * 1024 * 1024  # refuse oversized payloads before parsing (bomb defence)
 FIELD_SEPARATOR = "\0"
 
@@ -68,19 +72,27 @@ class SourceError(Exception):
 
 
 def read_locator(locator: str) -> bytes:
-    """Read a URL (http/https/file) or a local path. Raises SourceError on failure."""
+    """Read a URL (http/https, SSRF-hardened) or a local path.
+
+    Raises SourceError on failure. URL fetches route through tools/ssrf.py:
+    DNS-resolve + reject private/loopback/link-local/ULA, re-resolve per
+    redirect, 80/443 only, size cap, timeouts. file:// is refused outright —
+    pass the local path directly instead.
+    """
     if re.match(r"^https?://", locator):
-        req = urllib.request.Request(locator, headers={"User-Agent": UA})
         try:
-            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-                data = r.read(MAX_BYTES + 1)
-        except Exception as e:  # noqa: BLE001 — network failure is a first-class outcome here
-            raise SourceError(f"fetch failed for {locator}: {e}")
-    else:
-        p = pathlib.Path(locator)
-        if not p.exists():
-            raise SourceError(f"locator not found: {locator}")
-        data = p.read_bytes()
+            status, _headers, body = ssrf.safe_fetch(locator, max_bytes=MAX_BYTES)
+        except ssrf.SSRFError as e:
+            raise SourceError(f"fetch refused/failed for {locator}: {e.reason}")
+        if status >= 400:
+            raise SourceError(f"fetch failed for {locator}: HTTP {status}")
+        return body
+    if re.match(r"^file://", locator):
+        raise SourceError(f"file:// is not fetchable — pass the local path directly: {locator}")
+    p = pathlib.Path(locator)
+    if not p.exists():
+        raise SourceError(f"locator not found: {locator}")
+    data = p.read_bytes()
     if len(data) > MAX_BYTES:
         raise SourceError(f"payload over {MAX_BYTES} bytes refused: {locator}")
     return data

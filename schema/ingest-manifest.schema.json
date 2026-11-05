@@ -35,6 +35,14 @@
       "type": "string",
       "description": "Bottom Line Up Front: the one-paragraph summary. OPTIONAL."
     },
+    "tagline": {
+      "type": "string",
+      "description": "The signature one-line thesis. OPTIONAL — rides the manifest and every share surface."
+    },
+    "thumbnail": {
+      "type": "string",
+      "description": "The card thumbnail image URL (or package-relative path). OPTIONAL — rides the human card and the crawler's og:image (U6)."
+    },
     "load_order": {
       "type": "array",
       "minItems": 1,

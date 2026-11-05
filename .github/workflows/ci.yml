@@ -45,6 +45,12 @@ jobs:
       - name: Test suite (node:test, no server, no network)
         run: node --test tests/*.test.js
 
+      - name: Secrets scan (fail on any planted secret)
+        run: python3 tools/scan-secrets.py
+
+      - name: Manifest schema validation smoke
+        run: python3 ingest.py validate examples/simple-package
+
       - name: Reference CLI is loadable
         run: python3 ingest.py --help
 
