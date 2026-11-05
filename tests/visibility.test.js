@@ -44,10 +44,11 @@ function hit(url, headers = {}) {
 const GRANT = "open-sesame-token";
 const grantHash = crypto.createHash("sha256").update(GRANT).digest("hex").slice(0, 16);
 
-function manifest({ slug, vis, gestId, owner = "tester", grant }) {
-  const visLine = vis === "private"
-    ? `**Visibility:** private — ingestion requires an access grant (sha256 grant hash: \`${grant}\`).`
-    : `**Visibility:** ${vis} — ingestion is open to anyone.`;
+function manifest({ slug, vis, gestId, owner = "tester", grant, visLine }) {
+  const line = visLine !== undefined ? visLine
+    : vis === "private"
+      ? `**Visibility:** private — ingestion requires an access grant (sha256 grant hash: \`${grant}\`).`
+      : `**Visibility:** ${vis} — ingestion is open to anyone.`;
   return `# INGEST.md — machine manifest for \`${slug}\`
 
 > Convention: justinsharpe/ingest — INGEST.md (canonical) / AGENT-INGEST.md (alias), one schema.
@@ -56,7 +57,7 @@ function manifest({ slug, vis, gestId, owner = "tester", grant }) {
 > **Gest ID:** \`${gestId}\` — the load-bearing reference (owner in the URL is decoration).
 > **Owner:** ${owner}
 
-${visLine}
+${line}
 
 ## Load order (the one required section)
 
@@ -96,6 +97,20 @@ test("visibilityOf: parses the three tiers, defaults to unlisted", () => {
   assert.equal(visibilityOf(""), "unlisted");
 });
 
+test("visibilityOf: whitespace/case forms agree with the CLI grammar (private never downgrades)", () => {
+  // ingest.py parses with \s*([a-z]+) — parity means every whitespace form
+  // reads as its tier, never the resolvable "unlisted" default.
+  assert.equal(visibilityOf("**Visibility:**private — ..."), "private");    // no space
+  assert.equal(visibilityOf("**Visibility:**  private — ..."), "private");  // double space
+  assert.equal(visibilityOf("**Visibility:**\tprivate — ..."), "private");  // tab
+  assert.equal(visibilityOf("**Visibility:**\nprivate — ..."), "private");  // newline
+  assert.equal(visibilityOf("**Visibility:** Private — ..."), "private");   // capitalized (fail-closed)
+  assert.equal(visibilityOf("**Visibility:** PRIVATE — ..."), "private");   // upper
+  assert.equal(visibilityOf("**Visibility:** Public — ..."), "public");
+  assert.equal(visibilityOf("**Visibility:** Unlisted — ..."), "unlisted");
+  assert.equal(visibilityOf("**Visibility:** banana — ..."), "unlisted");   // non-tier → unlisted
+});
+
 test("grantHashOf: extracts the 16-hex grant hash, or null when absent", () => {
   assert.equal(grantHashOf("**Visibility:** private — ingestion requires an access grant (sha256 grant hash: `abcdef0123456789`)."), "abcdef0123456789");
   assert.equal(grantHashOf("**Visibility:** public — ..."), null);
@@ -119,6 +134,19 @@ test("access: public/unlisted allow; private gated by grant (fail closed)", () =
   assert.deepEqual(access(priv, "nope"), { allow: false, status: 403 });
   // fail closed: a private gest with NO recorded hash cannot be entered at all
   assert.deepEqual(access("**Visibility:** private — (no hash).", GRANT), { allow: false, status: 403 });
+});
+
+test("access: no-space / tab / capitalized private is still grant-gated (fail closed)", () => {
+  const forms = [
+    `**Visibility:**private — (sha256 grant hash: \`${grantHash}\`).`,   // no space
+    `**Visibility:**\tprivate — (sha256 grant hash: \`${grantHash}\`).`, // tab
+    `**Visibility:** Private — (sha256 grant hash: \`${grantHash}\`).`,  // capitalized
+  ];
+  for (const text of forms) {
+    assert.deepEqual(access(text, null), { allow: false, status: 403 });
+    assert.deepEqual(access(text, "nope"), { allow: false, status: 403 });
+    assert.deepEqual(access(text, GRANT), { allow: true });
+  }
 });
 
 // ════════════════════════════════════════════════════════════════════════
@@ -194,4 +222,29 @@ test("the host index lists only public gests (unlisted/private never enumerate)"
   assert.match(idx.text, /zpub/);
   assert.doesNotMatch(idx.text, /zunl/);
   assert.doesNotMatch(idx.text, /zpriv/);
+});
+
+test("(a) no-space private line is enforced end-to-end (the QA fail-open probe)", async () => {
+  // The exact divergence viiy-qa found: "**Visibility:**private" (no space) is
+  // validated private by the CLI yet was served as unlisted (anyone with the
+  // URL). It must 403 to an un-granted reader now, and open only with the grant.
+  PACKAGES["znspace"] = {
+    "INGEST.md": manifest({
+      slug: "znspace",
+      vis: "private",
+      gestId: "znspceg1",
+      grant: grantHash,
+      visLine: `**Visibility:**private — ingestion requires an access grant (sha256 grant hash: \`${grantHash}\`).`,
+    }),
+    "data.txt": "top-secret\n",
+  };
+  const denied = await hit("/znspace", { "user-agent": "curl/8.4" });
+  assert.equal(denied.status, 403);
+  assert.doesNotMatch(denied.text, /top-secret/); // no content leak
+  const granted = await hit(`/znspace?grant=${GRANT}`, { "user-agent": "curl/8.4" });
+  assert.equal(granted.status, 200);
+  assert.match(granted.text, /znspace bluf body/); // manifest opens with the grant
+  // and it must never enumerate on the public ledger
+  const ledger = JSON.parse((await hit("/gests.json")).text).gests;
+  assert.ok(!ledger.some((g) => g.slug === "znspace"), "private must not list");
 });

@@ -8,14 +8,24 @@
 // decides. Deterministic, receipt-tested (tests/visibility.test.js).
 const crypto = require("crypto");
 
-const VISIBILITY_RE = /\*\*Visibility:\*\* ([a-z]+)/;
+const VISIBILITY_RE = /\*\*Visibility:\*\*\s*([a-z]+)/i;
 const GRANT_HASH_RE = /sha256 grant hash: `([0-9a-f]{16})`/;
 
 // The manifest body's visibility tier. Unmarked manifests default to unlisted
 // (fail toward privacy: an unmarked gest is link-only, never listed).
+//
+// Grammar parity with the CLI: ingest.py parses this field with `\s*([a-z]+)`
+// (zero-or-more whitespace). The resolver must agree, so a manifest line
+// `**Visibility:**private` (no space), double-space, or tab — which the CLI
+// reads as "private" — is enforced as private HERE, never silently downgraded
+// to the (link-only-but-resolvable) "unlisted" default. Case is normalized
+// (the /i flag + toLowerCase) so a hand-edited "Private"/"PRIVATE" still gates
+// fail-closed instead of downgrading; only the three named tiers are meaningful.
 function visibilityOf(text) {
   const m = (text || "").match(VISIBILITY_RE);
-  return m ? m[1] : "unlisted";
+  if (!m) return "unlisted";
+  const v = m[1].toLowerCase();
+  return v === "public" || v === "unlisted" || v === "private" ? v : "unlisted";
 }
 
 // The stored grant hash (sha256 of the grant token, first 16 hex), or null
