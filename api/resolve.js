@@ -6,6 +6,11 @@
 const { classify, TRY } = require("./lib/classify.js");
 const PACKAGES = require("./lib/packages.generated.js");
 const { zipBuild } = require("./lib/zip.js");
+const ledger = require("./lib/ledger.js");
+const rateLimit = require("./lib/rate-limit.js");
+const { access, visibilityOf } = require("./lib/visibility.js");
+const { applySecurityHeaders } = require("./lib/headers.js");
+const { manifestFields, shareForms, ogBlock, thumbnailImg } = require("./lib/card.js");
 
 // In production, slugs map to package dirs under /packages at build time —
 // tools/embed-packages.js bakes them into api/lib/packages.generated.js, so
@@ -18,6 +23,10 @@ const SITE = {
 };
 
 module.exports = async (req, res) => {
+  // GEST U5: CSP + security headers on every surface, applied once before any
+  // writeHead so all responses (HTML card, OG unfurl, manifest, gests.json,
+  // embed.js, assets, 404/403) carry them.
+  applySecurityHeaders(res);
   const url = new URL(req.url, "http://x");
   // root /embed.js — the widget (host-aware: ORIGIN = the serving host)
   if (url.pathname === "/embed.js") {
@@ -57,33 +66,50 @@ module.exports = async (req, res) => {
   }
 
   // ── the machine ledger — every public gest, JSON (agents + integrations) ──
+  // U4: a real service — rate-limited, visibility-law-applied, stable contract
+  // (fingerprint / owner / visibility / content_hash lineage) + tenant scoping.
   if (url.pathname === "/gests.json") {
-    const ledger = Object.entries(PACKAGES)
-      .filter(([slug]) => !slug.startsWith("__") && slug !== "assets")
-      .map(([slug, files]) => {
-        const m = files["INGEST.md"] || files["AGENT-INGEST.md"] || "";
-        const text = typeof m === "string" && m.startsWith("__b64__") ? Buffer.from(m.slice(7), "base64").toString("utf8") : (m || "");
-        const f = manifestFields(text);
-        return {
-          slug,
-          gest_id: (text.match(/\*\*Gest ID:\*\* `([0-9a-z]{6,14})`/) || [])[1] || null,
-          owner: (text.match(/\*\*Owner:\*\* ([^\n]+)/) || [])[1] || null,
-          title: f.title,
-          bluf1: f.bluf1,
-          tagline: f.tagline || null,
-          fingerprint: f.fp,
-          visibility: (text.match(/\*\*Visibility:\*\* ([a-z]+)/) || [])[1] || "unlisted",
-        };
-      })
-      .filter((g) => g.gest_id && g.visibility === "public");
+    if (rateLimitGuard(req, res)) return;
+    const params = {};
+    for (const [k, v] of new URLSearchParams(url.search)) params[k] = v;
+    const gests = ledger.filterLedger(ledger.mergedLedger(PACKAGES), {
+      owner: params.owner,
+      q: params.q,
+    });
     res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-    return res.end(JSON.stringify({ gests: ledger }, null, 1));
+    return res.end(JSON.stringify({
+      contract: "gests.json/v1",
+      generated_at: new Date().toISOString(),
+      count: gests.length,
+      visibility: { listed: "public", unlisted: "link-only", private: "grant-gated" },
+      gests,
+    }, null, 1));
   }
 
   // ── the board — the human ledger (search/filterable, public gests only) ──
   if (url.pathname === "/board") {
+    if (rateLimitGuard(req, res)) return;
     const origin = `https://${siteName}`;
     return html(boardHTML(origin, siteName));
+  }
+
+  // ── U4 write path — arm a gest into the ledger (auth: write-owner) ──────
+  // read-public, write-owner: GET is open; POST requires an owner grant.
+  if (url.pathname === "/gests" && req.method === "POST") {
+    if (rateLimitGuard(req, res)) return;
+    const raw = await readBody(req);
+    let payload;
+    try { payload = JSON.parse(raw || "{}"); }
+    catch { return badRequestJSON(res, "invalid JSON body"); }
+    const auth = ledger.authorizeWrite(bearerToken(req), payload.owner, ledger.grantsFromEnv());
+    if (!auth.ok) return forbiddenJSON(res, auth.reason, auth.boundOwner);
+    const errors = ledger.validateEntry(payload);
+    if (errors.length) return badRequestJSON(res, errors.join("; "));
+    const entry = ledger.entryFromPayload(payload);
+    const existed = ledger.overlay.has(entry.gest_id);
+    ledger.upsertOverlay(entry);
+    res.writeHead(existed ? 200 : 201, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+    return res.end(JSON.stringify({ ok: true, gest: entry }, null, 1));
   }
 
   // ── owner-scoped routing: /<owner>/<gest-id> and /<gest-id> both resolve;
@@ -130,6 +156,7 @@ module.exports = async (req, res) => {
 
   // ── package routes ─────────────────────────────────────────────
   if (view === "manifest") {
+    if (enforceVisibility(slug, req, res)) return;
     const manifest = readPackageFile(slug, file || "INGEST.md");
     if (!manifest) return notFound(res, slug);
     res.writeHead(200, {
@@ -141,6 +168,7 @@ module.exports = async (req, res) => {
   }
 
   if (view === "og" || view === "card") {
+    if (enforceVisibility(slug, req, res)) return;
     const manifest = readPackageFile(slug, "INGEST.md");
     if (!manifest) return notFound(res, slug);
     const cardPage = cardHTML(manifest, {
@@ -153,6 +181,7 @@ module.exports = async (req, res) => {
   }
 
   if (view === "file") {
+    if (enforceVisibility(slug, req, res)) return;
     // one-click install: the whole artifact set as a deterministic zip
     if (file === "archive.zip") {
       const entries = PACKAGES[slug];
@@ -231,8 +260,35 @@ function ownerOf(slug) {
   return ((t.match(/\*\*Owner:\*\* ([^\n]+)/) || [])[1] || "").trim().toLowerCase();
 }
 
+// ── U3 visibility enforcement (public / unlisted / private) ────────────
+// The privacy law, applied at every serving choke point. The grant is the
+// ONLY path into a private gest; the owner in the URL is decoration (the
+// x.com/i/status law) and never grants access on its own.
+function grantToken(req) {
+  const url = new URL(req.url, "http://x");
+  const q = url.searchParams.get("grant");
+  if (q != null && q !== "") return q;
+  const headers = req.headers || {};
+  for (const k of Object.keys(headers)) {
+    if (k.toLowerCase() === "x-gest-grant") {
+      const v = String(headers[k]).trim();
+      if (v) return v;
+    }
+  }
+  return null;
+}
+
+// returns true when access is denied and the response has already been written
+function enforceVisibility(slug, req, res) {
+  const { allow, status } = access(manifestOf(slug).text, grantToken(req));
+  if (allow) return false;
+  forbidden(res, slug, status);
+  return true;
+}
+
 // owner/id serving: same three surfaces, same code path as slug serving
 function serveGest(req, res, slug, siteName, host) {
+  if (enforceVisibility(slug, req, res)) return;
   const { classify } = require("./lib/classify.js");
   const url = new URL(req.url, "http://x");
   const { view } = classify(url.pathname, req.headers);
@@ -294,7 +350,12 @@ function readPackageFile(slug, file) {
 }
 
 function listSlugs() {
-  return Object.keys(PACKAGES);
+  // The host index is a public ledger surface: only public gests list here.
+  // Unlisted gests resolve by reference but never appear; private gests need a
+  // grant and are never enumerated. Internal entries (__*, assets) are hidden.
+  return Object.keys(PACKAGES).filter(
+    (slug) => !slug.startsWith("__") && slug !== "assets" && visibilityOf(manifestOf(slug).text) === "public"
+  );
 }
 
 function esc(s) {
@@ -312,14 +373,16 @@ function notFound(res, slug, file) {
   res.end(body);
 }
 
-function manifestFields(text) {
-  const fp = (text.match(/`([0-9a-f]{16})`/) || [])[1] || "";
-  const bluf = (text.match(/## BLUF\s*\n\n([\s\S]+?)(?:\n\n|\Z)/) || [])[1] || "";
-  const bluf1 = bluf.replace(/\s+/g, " ").trim().split(/(?<=[.!?])\s/)[0] || bluf.slice(0, 160);
-  const files = [...text.matchAll(/^- `([^`]+)` — ([\d,]+) bytes/gm)].map((m) => ({ path: m[1], size: m[2] }));
-  const title = (text.match(/^# INGEST\.md — machine manifest for `([^`]+)`/) || [])[1] || "package";
-  const tagline = (text.match(/## (?:Tagline|Quip)\s*\n\n> ?(.+)/) || [])[1] || "";
-  return { fp, bluf: bluf.replace(/\s+/g, " ").trim(), bluf1, files, title, tagline };
+function forbidden(res, slug, status = 403) {
+  // quip (the Sept-19 microcopy law): our lingo at the touchpoints. The body
+  // reveals only that a grant is required — never the manifest's contents.
+  const body = `<!doctype html><html><head><meta charset="utf-8"><title>private — agnt.in</title></head>
+<body style="font-family:ui-monospace,monospace;background:#0d1117;color:#e6edf3;padding:8vh 24px">
+<h2>403</h2><p><i>this one keeps a secret — and you don't hold the key</i></p>
+<p>This gest is <code>private</code>; it opens only with the access grant.</p>
+<p><a style="color:#58a6ff" href="/">← agnt.in</a></p></body></html>`;
+  res.writeHead(status, { "Content-Type": "text/html; charset=utf-8", "X-Robots-Tag": "noindex, nofollow" });
+  res.end(body);
 }
 
 function cardHTML(m, { ogOnly = false, siteName, slug, origin } = {}) {
@@ -334,17 +397,17 @@ function cardHTML(m, { ogOnly = false, siteName, slug, origin } = {}) {
   // (Reader-style proxies and LLMs follow links verbatim).
   const base = slug && origin ? `${origin}/${slug}` : "";
   const manifestHref = base ? `${base}/INGEST.md` : "./INGEST.md";
-  const ogBlock = `
-<meta property="og:title" content="${esc(f.title)}">
-<meta property="og:description" content="${esc(f.bluf1)}">
-<meta property="og:type" content="website">
-<meta property="og:url" content="${esc(base)}">
-<meta property="og:image" content="${esc(m.image || (origin + ogCard))}">
-<meta property="og:image:width" content="1200">
-<meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="Share card: ${esc(f.title)}, one-paragraph summary, and sha256 fingerprint on a dark background.">
-<meta property="og:site_name" content="${esc(siteName)}">
-<meta name="twitter:card" content="summary_large_image">`;
+  // U6: the OG/crawler block renders FROM the manifest (two-surfaces-one-truth).
+  // og:image prefers the manifest's thumbnail; falls back to the host owl card.
+  const ogBlockHtml = ogBlock(f, {
+    siteName,
+    slug,
+    origin,
+    fallbackImage: origin ? `${origin}${ogCard}` : ogCard,
+  });
+  // U6: the three share-out forms (one-liner + embed snippet + direct URL),
+  // derived from the manifest URL — never a hand-written copy.
+  const share = shareForms(base || `${origin}/${slug}`, origin || siteName);
   const logoSVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="34" height="34" style="border-radius:9px;background:#161b22">
     <path d="M17 39 a15 15 0 0 0 30 0" fill="none" stroke="#58a6ff" stroke-width="3.5" stroke-linecap="round"/>
     <circle cx="32" cy="26" r="5.5" fill="#ff8c66"/>
@@ -363,6 +426,14 @@ function cardHTML(m, { ogOnly = false, siteName, slug, origin } = {}) {
   .oneliner { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:14px 16px;
               font-family:ui-monospace,Menlo,Consolas,monospace; font-size:13px; color:#e6edf3; }
   .oneliner b { color:#58a6ff; }
+  .thumb { display:block; max-width:100%; border-radius:10px; border:1px solid #30363d; margin:0 0 24px; }
+  .share { margin:28px 0 0; }
+  .share h2 { font-size:15px; color:#58a6ff; margin:0 0 12px; }
+  .form { margin:12px 0; }
+  .form .label { font-size:12px; color:#8b949e; text-transform:uppercase; letter-spacing:.05em; margin-bottom:6px; }
+  .form pre { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:12px 14px;
+              font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12.5px; color:#e6edf3;
+              overflow-x:auto; white-space:pre-wrap; word-break:break-all; margin:0; }
   .files { margin:32px 0 0; font-size:13px; color:#8b949e; font-family:ui-monospace,monospace; line-height:1.8; }
   a { color:#58a6ff; text-decoration:none; }
 </style>`;
@@ -372,17 +443,23 @@ function cardHTML(m, { ogOnly = false, siteName, slug, origin } = {}) {
   <h1>${esc(f.title)}</h1>
   <div class="sub">A gest — a shareable package any agent can ingest · INGEST.md convention · ${esc(siteName)}</div>
   ${f.tagline ? `<div class="tagline">&gt; ${esc(f.tagline)}</div>` : ""}
+  ${thumbnailImg(f, { alt: f.title })}
   <div class="bluf">${esc(f.bluf)}</div>
   <div class="fp">sha256 fingerprint: ${esc(f.fp)}</div>
   <div class="fphint">verify after transfer — if it differs, the tree changed</div>
-  <div class="oneliner">For your agent: <b>Read ${canonical} at the artifact root and execute its load order; it routes everything else.</b></div>
+  <div class="share">
+    <h2>Share</h2>
+    <div class="form"><div class="label">one-liner — for any agent</div><pre>${esc(share.oneLiner)}</pre></div>
+    <div class="form"><div class="label">embed — drop into any site</div><pre>${esc(share.embedSnippet)}</pre></div>
+    <div class="form"><div class="label">direct URL</div><pre>${esc(share.directUrl)}</pre></div>
+  </div>
   ${pasteBlocks(slug, origin, "")}
   <div class="files">${f.files.map((x) => `${esc(x.path)} — ${esc(x.size)} bytes`).join("<br>")}</div>
   <p><a href="${manifestHref}">INGEST.md manifest →</a> · <a href="${base ? `${base}/archive.zip` : "./archive.zip"}">⬇ Download .zip</a>${base ? ` · <a href="${base}/INGEST.md">absolute</a>` : ""} · <a href="${origin || "/"}">← host home</a></p>
 </div>`;
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 64 64%27%3E%3Crect width=%2764%27 height=%2764%27 rx=%2714%27 fill=%27%230d1117%27/%3E%3Cpath d=%27M17 39 a15 15 0 0 0 30 0%27 fill=%27none%27 stroke=%27%2358a6ff%27 stroke-width=%273.5%27 stroke-linecap=%27round%27/%3E%3Ccircle cx=%2732%27 cy=%2726%27 r=%275.5%27 fill=%27%23ff8c66%27/%3E%3C/svg%3E">
-<title>${esc(f.title)} — ${esc(siteName)}</title>${ogBlock}${style}
+<title>${esc(f.title)} — ${esc(siteName)}</title>${ogBlockHtml}${style}
 </head><body>${body}</body></html>`;
 }
 
@@ -550,4 +627,77 @@ a{color:#58a6ff;text-decoration:none} h1{font-size:28px} li{margin:8px 0}</style
 <ul>${list}</ul>
 <p><a href="/try">try the playground →</a></p>
 </body></html>`;
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// U4 ledger-service helpers — rate limit + write auth (read-public, write-owner)
+// ═════════════════════════════════════════════════════════════════════════
+
+// The rate-limit identity: the client's address. Trust the platform's
+// X-Forwarded-For first hop, then X-Real-IP, then the socket, else "local".
+function clientKey(req) {
+  const h = req.headers || {};
+  const xff = (h["x-forwarded-for"] || h["X-Forwarded-For"] || "").toString();
+  if (xff) return `ip:${xff.split(",")[0].trim()}`;
+  const rip = (h["x-real-ip"] || h["X-Real-IP"] || "").toString();
+  if (rip) return `ip:${rip.trim()}`;
+  if (req.socket && req.socket.remoteAddress) return `ip:${req.socket.remoteAddress}`;
+  return "ip:local";
+}
+
+// Returns true when the client is over its window and a 429 has been written.
+function rateLimitGuard(req, res) {
+  const r = rateLimit.check(clientKey(req));
+  if (!r.allowed) {
+    res.writeHead(429, {
+      "Content-Type": "application/json",
+      "Retry-After": String(r.retryAfterSec),
+      "Access-Control-Allow-Origin": "*",
+    });
+    res.end(JSON.stringify({ error: "rate_limited", retry_after: r.retryAfterSec }));
+    return true;
+  }
+  return false;
+}
+
+// Read the request body as text. The test harness supplies req.body directly;
+// a real server (Vercel) supplies a stream.
+function readBody(req) {
+  return new Promise((resolve) => {
+    if (typeof req.body === "string" || Buffer.isBuffer(req.body)) {
+      return resolve(req.body.toString("utf8"));
+    }
+    if (typeof req.on === "function") {
+      const chunks = [];
+      req.on("data", (c) => chunks.push(c));
+      req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+      req.on("error", () => resolve(""));
+    } else {
+      resolve("");
+    }
+  });
+}
+
+// The write-owner credential: an Authorization Bearer token (the owner grant),
+// or a raw token value sent in the same header.
+function bearerToken(req) {
+  const h = req.headers || {};
+  for (const k of Object.keys(h)) {
+    if (k.toLowerCase() === "authorization") {
+      const v = String(h[k]).trim();
+      const m = v.match(/^Bearer\s+(.+)$/i);
+      return m ? m[1] : v;
+    }
+  }
+  return null;
+}
+
+function badRequestJSON(res, message) {
+  res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+  res.end(JSON.stringify({ error: "bad_request", detail: message }));
+}
+
+function forbiddenJSON(res, reason, boundOwner) {
+  res.writeHead(403, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+  res.end(JSON.stringify({ error: "forbidden", reason, bound_owner: boundOwner || null }));
 }

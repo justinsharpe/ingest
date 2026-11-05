@@ -9,6 +9,8 @@ Commands:
   ingest init <dir>     scan artifact dir -> emit INGEST.md (BLUF, load order,
                         file map, sha256 fingerprint)
   ingest verify <dir>   recompute the fingerprint; compare against the manifest
+  ingest validate <dir> validate the manifest against the schema (fingerprint /
+                        load order / file map; reject malformed)
   ingest card <dir>     emit the share card (human surface) + the one-liner
                         (machine surface) from the manifest
 
@@ -26,6 +28,7 @@ import sys
 CANONICAL = "INGEST.md"
 ALIAS = "AGENT-INGEST.md"
 ID_RE = re.compile(r"^[0-9a-z]{6,14}$")
+FP_RE = re.compile(r"^[0-9a-f]{16}$")
 
 
 def gen_gest_id():
@@ -117,16 +120,67 @@ def verify_consistency(root: pathlib.Path, file_map: dict):
     return findings
 
 
-def manifest_text(root, bluf, files, fp, video="", visibility="unlisted", grant_line="", tagline="", gest_id="", owner=""):
+def _section_text(text: str, heading: str) -> str:
+    """Raw text of a `## heading` section, up to the next `## ` heading or EOF."""
+    m = re.search(re.escape(heading) + r"[^\n]*\n(.*?)(?=\n##\s|\Z)", text, re.S)
+    return m.group(1).strip() if m else ""
+
+
+def _section_items(text: str, heading: str) -> list:
+    """List items (numbered or bulleted) under a `## heading` section."""
+    items = []
+    for line in _section_text(text, heading).split("\n"):
+        line = line.strip()
+        if re.match(r"^\d+\.\s+", line) or re.match(r"^[-*]\s+", line):
+            items.append(line)
+    return items
+
+
+def parse_manifest(text: str) -> dict:
+    """Extract the schema fields from a manifest (the markdown projection)."""
+    fp = (re.search(r"fingerprint \(sha256[^)]*\):\*?\*?\s*`([0-9a-f]{16})`", text)
+          or re.search(r"`([0-9a-f]{16})`", text))
+    vis = re.search(r"\*\*Visibility:\*\*\s*([a-z]+)", text)
+    return {
+        "fingerprint": fp.group(1) if fp else "",
+        "load_order": _section_items(text, "## Load order"),
+        "file_map": _section_items(text, "## File map"),
+        "bluf": _section_text(text, "## BLUF"),
+        "visibility": vis.group(1) if vis else "",
+    }
+
+
+def validate_manifest(parsed: dict) -> list:
+    """Return the list of schema violations (empty = valid). BLUF is optional;
+    fingerprint, load order and file map are required."""
+    errors = []
+    if not FP_RE.fullmatch(parsed["fingerprint"]):
+        errors.append("fingerprint missing or malformed (must be 16 hex chars)")
+    if not parsed["load_order"]:
+        errors.append("'## Load order' section missing or empty — the one required section")
+    if not parsed["file_map"]:
+        errors.append("'## File map' section missing or empty — required")
+    if parsed["visibility"] and parsed["visibility"] not in ("public", "unlisted", "private"):
+        errors.append(f"visibility '{parsed['visibility']}' must be public|unlisted|private")
+    return errors
+
+
+def manifest_text(root, bluf, files, fp, video="", visibility="unlisted", grant_line="", tagline="", gest_id="", owner="", thumbnail=""):
+
     fm = "\n".join(f"- `{f.relative_to(root).as_posix()}` — {f.stat().st_size:,} bytes" for f in files)
     tagline_block = "\n## Tagline\n\n> " + tagline + "\n" if tagline else ""
     id_block = f"\n> **Gest ID:** `{gest_id}` — the load-bearing reference (owner in the URL is decoration).\n" if gest_id else ""
     owner_block = f"> **Owner:** {owner}\n" if owner else ""
+    # U6: the thumbnail rides both surfaces — the human card shows it, the crawler's
+    # og:image uses it. It is a metadata line (like Visibility/Owner), an image URL
+    # or package-relative path; the card renderer parses it and falls back to the
+    # host owl card when absent.
+    thumbnail_block = f"\n**Thumbnail:** {thumbnail}\n" if thumbnail else ""
     return f"""# INGEST.md — machine manifest for `{root.name}`
 
 > Convention: justinsharpe/ingest — INGEST.md (canonical) / AGENT-INGEST.md (alias), one schema.
 > **Package fingerprint (sha256):** `{fp}` — verify after transfer; if it differs, the tree changed.
-{id_block}{owner_block}{grant_line}
+{id_block}{owner_block}{grant_line}{thumbnail_block}
 ## Load order (the one required section)
 
 1. BLUF (below) — the one-paragraph bottom line.
@@ -178,11 +232,12 @@ def cmd_init(args):
             grant_line += "> No --grant given: the grant defaults to the fingerprint — ISSUE a real grant before sharing privately.\n"
     else:
         grant_line = f"\n**Visibility:** {args.visibility} — ingestion is {'open to anyone with the reference' if args.visibility == 'public' else 'open to anyone holding the reference (not listed/indexed)'}.\n"
-    (root / CANONICAL).write_text(manifest_text(root, bluf, files, fp, args.video, args.visibility, grant_line, getattr(args, "tagline", ""), gest_id, owner), encoding="utf-8")
+    (root / CANONICAL).write_text(manifest_text(root, bluf, files, fp, args.video, args.visibility, grant_line, getattr(args, "tagline", ""), gest_id, owner, getattr(args, "thumbnail", "")), encoding="utf-8")
     print(f"OK init: {root / CANONICAL}")
     print(f"   {len(files)} files | fingerprint {fp} | visibility {args.visibility}"
           + (f" | grant issued (hash {grant_hash})" if args.visibility == "private" else ""))
-    print(f"   gest id: {gest_id}" + (f" | owner: {owner}" if owner else ""))
+    print(f"   gest id: {gest_id}" + (f" | owner: {owner}" if owner else "")
+          + (f" | thumbnail: {getattr(args, 'thumbnail', '')}" if getattr(args, "thumbnail", "") else ""))
     return 0
 
 
@@ -220,6 +275,25 @@ def cmd_verify(args):
     ok = fp_ok and fm_ok and not findings
     print("VERIFY " + ("PASS" if ok else "FAIL — refused"))
     return 0 if ok else 2
+
+
+def cmd_validate(args):
+    root = pathlib.Path(args.dir)
+    m = find_manifest(root)
+    if m is None:
+        print(f"ERROR: no {CANONICAL} or {ALIAS} in {root}"); return 1
+    text = m.read_text(encoding="utf-8")
+    parsed = parse_manifest(text)
+    errors = validate_manifest(parsed)
+    if errors:
+        for e in errors:
+            print(f"INVALID: {e}")
+        print(f"   manifest file: {m.name}")
+        return 2
+    print(f"OK: manifest schema valid ({m.name})")
+    print(f"   fingerprint {parsed['fingerprint']} | load order {len(parsed['load_order'])} step(s)"
+          f" | file map {len(parsed['file_map'])} file(s)")
+    return 0
 
 
 def cmd_pack(args):
@@ -273,9 +347,12 @@ def main():
     p_init.add_argument("--tagline", default="", help="the signature one-line thesis — rides the manifest and every share surface")
     p_init.add_argument("--gest-id", default="", help="override the auto-generated base36 gest id (6-14 lowercase alphanumerics)")
     p_init.add_argument("--owner", default="", help="the owner handle — decoration in the URL, identity on the board (e.g. 'justin')")
+    p_init.add_argument("--thumbnail", default="", help="the card thumbnail image (URL or package-relative path) — rides the card + og:image (U6)")
     p_init.set_defaults(fn=cmd_init)
     p_verify = sub.add_parser("verify", help="recompute + compare the fingerprint")
     p_verify.add_argument("dir"); p_verify.set_defaults(fn=cmd_verify)
+    p_validate = sub.add_parser("validate", help="validate the manifest against the schema")
+    p_validate.add_argument("dir"); p_validate.set_defaults(fn=cmd_validate)
     p_card = sub.add_parser("card", help="emit the share card + one-liner")
     p_card.add_argument("dir"); p_card.set_defaults(fn=cmd_card)
     p_pack = sub.add_parser("pack", help="zip the artifact set (manifest excluded from the hash, included in the zip) -> <dir>.zip beside it")
