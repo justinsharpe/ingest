@@ -57,6 +57,18 @@ test("package embed.js also serves (/<slug>/embed.js)", async () => {
   assert.match(r.text, /data-ingest/);
 });
 
+test("U6: the human card emits the three share-out forms (from the manifest URL)", async () => {
+  const human = await hit("/agentic-testing", { "user-agent": "Mozilla/5.0 Safari", host: "viiy.to" });
+  assert.equal(human.status, 200);
+  // one-liner (agent handoff) — verbatim
+  assert.match(human.text, /Read INGEST\.md at https:\/\/viiy\.to\/agentic-testing\/INGEST\.md and execute its load order/);
+  // embed snippet (<div data-ingest>) — esc() escaped in the <pre>
+  assert.match(human.text, /&lt;div data-ingest=&quot;https:\/\/viiy\.to\/agentic-testing&quot;&gt;&lt;\/div&gt;/);
+  assert.match(human.text, /&lt;script src=&quot;https:\/\/viiy\.to\/embed\.js&quot;&gt;&lt;\/script&gt;/);
+  // direct URL
+  assert.match(human.text, /direct URL/);
+});
+
 test("archive.zip is a real, unzip-clean zip of the artifact set", async () => {
   const r = await hit("/agentic-testing/archive.zip", { host: "viiy.to" });
   assert.equal(r.status, 200);
