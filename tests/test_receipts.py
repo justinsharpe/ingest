@@ -81,6 +81,14 @@ class VerifyBeforeShipReceipts(unittest.TestCase):
     def verify(self):
         return run_cli("verify", str(self.pkg))
 
+    def pack(self):
+        return run_cli("pack", str(self.pkg))
+
+    @property
+    def zip_path(self):
+        # make_archive writes <dir>.zip BESIDE the dir (never inside it)
+        return self.pkg.parent / (self.pkg.name + ".zip")
+
     # -- control cases ------------------------------------------------
     def test_clean_package_verifies_exit_0(self):
         self.arm()
@@ -165,6 +173,57 @@ class VerifyBeforeShipReceipts(unittest.TestCase):
         r = self.verify()
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("File map", r.stdout)
+
+    # -- pack refuses an inconsistent tree (verify-before-ship) --------
+    def test_clean_package_packs_exit_0(self):
+        self.arm()
+        self.assertFalse(self.zip_path.exists())
+        r = self.pack()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("OK pack", r.stdout)
+        self.assertTrue(self.zip_path.exists())
+
+    def test_pack_phantom_file_exit_2_no_zip(self):
+        self.arm()
+        text = self.read_manifest().replace(
+            "## File map\n", "## File map\n- `ghost.txt` — 4 bytes\n", 1)
+        self.write_manifest(text)
+        r = self.pack()
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("PHANTOM", r.stdout)
+        self.assertIn("`ghost.txt`", r.stdout)
+        self.assertFalse(self.zip_path.exists())
+
+    def test_pack_unlisted_file_exit_2_no_zip(self):
+        self.arm()
+        old_fp = ingest.fingerprint_files(self.pkg)
+        (self.pkg / "extra.txt").write_text("extra\n", encoding="utf-8")
+        new_fp = ingest.fingerprint_files(self.pkg)
+        self.write_manifest(self.read_manifest().replace(old_fp, new_fp, 1))
+        r = self.pack()
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("UNLISTED", r.stdout)
+        self.assertIn("`extra.txt`", r.stdout)
+        self.assertFalse(self.zip_path.exists())
+
+    def test_pack_size_mismatch_exit_2_no_zip(self):
+        self.arm()
+        text = re.sub(
+            r"(`data\.txt` — )\d+( bytes)", r"\g<1>999\g<2>",
+            self.read_manifest(), count=1)
+        self.write_manifest(text)
+        r = self.pack()
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("SIZE mismatch", r.stdout)
+        self.assertFalse(self.zip_path.exists())
+
+    def test_pack_missing_file_map_section_exit_2_no_zip(self):
+        self.arm()
+        self.write_manifest(self.read_manifest().replace("## File map", "## Files", 1))
+        r = self.pack()
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("File map", r.stdout)
+        self.assertFalse(self.zip_path.exists())
 
 
 if __name__ == "__main__":

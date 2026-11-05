@@ -120,6 +120,37 @@ def verify_consistency(root: pathlib.Path, file_map: dict):
     return findings
 
 
+FINDING_LABELS = {
+    "phantom": "PHANTOM file (listed in map, absent from tree)",
+    "size": "SIZE mismatch (listed vs actual bytes)",
+    "unlisted": "UNLISTED file (in tree, absent from map)",
+}
+
+
+def check_consistency(root: pathlib.Path, text: str):
+    """The verify-before-ship check, shared by `verify` and `pack`.
+
+    Returns (manifest_fp, fp, fp_ok, fm_ok, findings):
+      manifest_fp — the manifest's claimed fingerprint ("" when absent)
+      fp          — the recomputed tree fingerprint
+      fp_ok       — fingerprint present and equal to the tree
+      fm_ok       — a `## File map` section was found
+      findings    — verify_consistency() findings (phantom/size/unlisted)
+
+    `pack` calls this so it can never ship a tree whose manifest enumerates a
+    phantom file, an unlisted file, or a wrong size — the exact refusal set
+    `verify` enforces — rather than duplicating only the fingerprint comparison.
+    """
+    got = re.search(r"fingerprint \(sha256\)\:\*?\*? `([0-9a-f]{16})`", text)
+    manifest_fp = got.group(1) if got else ""
+    fp = fingerprint_files(root)
+    fp_ok = manifest_fp != "" and fp == manifest_fp
+    file_map = parse_file_map(text)
+    fm_ok = file_map is not None
+    findings = verify_consistency(root, file_map) if file_map is not None else []
+    return manifest_fp, fp, fp_ok, fm_ok, findings
+
+
 def _section_text(text: str, heading: str) -> str:
     """Raw text of a `## heading` section, up to the next `## ` heading or EOF."""
     m = re.search(re.escape(heading) + r"[^\n]*\n(.*?)(?=\n##\s|\Z)", text, re.S)
@@ -247,31 +278,19 @@ def cmd_verify(args):
     if m is None:
         print(f"ERROR: no {CANONICAL} or {ALIAS} in {root}"); return 1
     text = m.read_text(encoding="utf-8")
-    got = re.search(r"fingerprint \(sha256\)\:\*?\*? `([0-9a-f]{16})`", text)
-    if not got:
+    manifest_fp, fp, fp_ok, fm_ok, findings = check_consistency(root, text)
+    if manifest_fp == "":
         print("ERROR: manifest carries no fingerprint"); return 1
-    manifest_fp = got.group(1)
-    fp = fingerprint_files(root)
-    fp_ok = fp == manifest_fp
 
     # File-map consistency: the manifest must enumerate the tree exactly.
     # A phantom (listed-but-absent) or unlisted (present-but-unlisted) file, or
     # a size mismatch, is a refusal — never silently accepted (verify-before-ship).
-    file_map = parse_file_map(text)
-    fm_ok = file_map is not None
-    findings = verify_consistency(root, file_map) if file_map is not None else []
-
     print(f"{'OK' if fp_ok else 'MISMATCH'}: manifest {manifest_fp} vs recomputed {fp}")
     print(f"   manifest file: {m.name} ({'canonical' if m.name == CANONICAL else 'alias'})")
     if not fm_ok:
         print("FLAG: manifest carries no `## File map` section (required) — the file set is unverifiable")
-    labels = {
-        "phantom": "PHANTOM file (listed in map, absent from tree)",
-        "size": "SIZE mismatch (listed vs actual bytes)",
-        "unlisted": "UNLISTED file (in tree, absent from map)",
-    }
     for kind, path in sorted(findings):
-        print(f"FLAG: {labels[kind]}: `{path}`")
+        print(f"FLAG: {FINDING_LABELS[kind]}: `{path}`")
     ok = fp_ok and fm_ok and not findings
     print("VERIFY " + ("PASS" if ok else "FAIL — refused"))
     return 0 if ok else 2
@@ -301,13 +320,21 @@ def cmd_pack(args):
     m = find_manifest(root)
     if m is None:
         print(f"ERROR: no manifest in {root} — run `ingest init` first"); return 1
-    # verify BEFORE packing: never ship a mismatched tree
-    import re
+    # verify BEFORE packing: never ship a tree that would fail its own `verify`.
+    # Mirror cmd_verify's hardening exactly — fingerprint AND file-map consistency
+    # (phantom / unlisted / size mismatch / missing File map) — not just the
+    # fingerprint comparison, so `pack` can't emit a zip that `verify` refuses.
     text = m.read_text(encoding="utf-8")
-    got = re.search(r"fingerprint \(sha256\)\:\*?\*? `([0-9a-f]{16})`", text)
-    fp = fingerprint_files(root)
-    if not got or got.group(1) != fp:
-        print(f"ERROR: fingerprint mismatch (manifest {got.group(1) if got else '?'} vs recomputed {fp}) — run `ingest init` again"); return 2
+    manifest_fp, fp, fp_ok, fm_ok, findings = check_consistency(root, text)
+    if not fp_ok:
+        print(f"ERROR: fingerprint mismatch (manifest {manifest_fp or '?'} vs recomputed {fp}) — run `ingest init` again"); return 2
+    if not fm_ok:
+        print("ERROR: manifest carries no `## File map` section (required) — the file set is unverifiable; run `ingest init` again"); return 2
+    if findings:
+        for kind, path in sorted(findings):
+            print(f"ERROR: {FINDING_LABELS[kind]}: `{path}`")
+        print("   refusing to pack — the tree would fail `ingest verify`; run `ingest init` again")
+        return 2
     # zip BESIDE the dir (never inside it — no self-inclusion), manifest included
     dest = shutil.make_archive(str(root.resolve()), "zip", root_dir=root.parent, base_dir=root.name)
     # exclude a stale sibling zip from a previous pack? not needed: make_archive names it <dir>.zip
